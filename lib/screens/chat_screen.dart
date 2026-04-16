@@ -262,8 +262,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    final bottomInset = MediaQuery.viewInsetsOf(context).bottom;
-
     return Scaffold(
       resizeToAvoidBottomInset: true,
       body: Column(
@@ -385,7 +383,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                             12,
                             12,
                             12,
-                            12 + bottomInset,
+                            12,
                           ),
                           child: Row(
                             crossAxisAlignment: CrossAxisAlignment.end,
