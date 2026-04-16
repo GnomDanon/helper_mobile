@@ -5,6 +5,7 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import '../config/app_config.dart';
 import '../models/chat_message.dart';
 import '../services/chat_api_service.dart';
+import '../services/local_llm_service.dart';
 import '../services/chat_storage.dart';
 import '../theme/app_colors.dart';
 import '../widgets/emergency_footer.dart';
@@ -27,6 +28,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final _input = TextEditingController();
   final _scroll = ScrollController();
   final _api = ChatApiService();
+  final _localLlm = LocalLlmService.instance;
   final _storage = ChatStorage.instance;
   final stt.SpeechToText _speech = stt.SpeechToText();
 
@@ -34,11 +36,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _loading = false;
   bool _listening = false;
   bool _speechReady = false;
+  bool _modelPreparing = false;
+  LocalModelProgress _localModelProgress = const LocalModelProgress(
+    status: LocalModelStatus.idle,
+    message: 'Ожидание запуска локальной модели',
+  );
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _localModelProgress = _localLlm.progress.value;
+    _localLlm.progress.addListener(_onLocalModelProgress);
     _init();
   }
 
@@ -65,15 +74,35 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       },
     );
     if (mounted) setState(() {});
+    _warmupLocalModel();
+  }
+
+  Future<void> _warmupLocalModel() async {
+    if (mounted) setState(() => _modelPreparing = true);
+    try {
+      await _localLlm.ensureReady();
+    } catch (_) {
+      // Не блокируем чат: модель можно попробовать инициализировать повторно при отправке.
+    } finally {
+      if (mounted) setState(() => _modelPreparing = false);
+    }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _localLlm.progress.removeListener(_onLocalModelProgress);
     _persist();
     _input.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  void _onLocalModelProgress() {
+    if (!mounted) return;
+    setState(() {
+      _localModelProgress = _localLlm.progress.value;
+    });
   }
 
   @override
@@ -102,19 +131,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final text = _input.text.trim();
     if (text.isEmpty || _loading) return;
 
-    if (AppConfig.normalizedApiBase.isEmpty) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Не задан API_BASE_URL. Запустите приложение с '
-            '--dart-define=API_BASE_URL=https://.../',
-          ),
-        ),
-      );
-      return;
-    }
-
     _input.clear();
     setState(() {
       _messages.add(ChatMessage(text: text, sender: MessageSender.user));
@@ -123,18 +139,87 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     await _persist();
     await _scrollToBottom();
 
-    final reply = await _api.sendMessage(text, _messages);
+    ChatMessage? reply;
+    if (AppConfig.normalizedApiBase.isNotEmpty) {
+      reply = await _api.sendMessage(text, _messages);
+    }
+
+    if (reply == null) {
+      final localHistory = List<ChatMessage>.from(_messages);
+      var streamMessageIndex = -1;
+      var streamedText = '';
+      try {
+        if (mounted) {
+          setState(() {
+            _messages.add(
+              const ChatMessage(
+                text: 'Генерирую локальный ответ...',
+                sender: MessageSender.system,
+              ),
+            );
+            streamMessageIndex = _messages.length - 1;
+          });
+          await _scrollToBottom();
+        }
+
+        await for (final token in _localLlm.streamResponse(text, localHistory)) {
+          streamedText += token;
+          if (!mounted || streamMessageIndex < 0) continue;
+          setState(() {
+            _messages[streamMessageIndex] = ChatMessage(
+              text: streamedText.isEmpty
+                  ? 'Генерирую локальный ответ...'
+                  : streamedText.replaceAll('\n', '<br/>'),
+              sender: MessageSender.system,
+            );
+          });
+        }
+
+        if (streamMessageIndex >= 0) {
+          reply = _messages[streamMessageIndex];
+        } else {
+          reply = ChatMessage(
+            text: streamedText.isEmpty
+                ? 'Не удалось получить ответ локально.'
+                : streamedText.replaceAll('\n', '<br/>'),
+            sender: MessageSender.system,
+          );
+        }
+      } catch (_) {
+        if (mounted && streamMessageIndex >= 0) {
+          setState(() {
+            _messages[streamMessageIndex] = const ChatMessage(
+              text: 'Сервер недоступен и локальная модель не готова. '
+                  'Проверьте LOCAL_MODEL_URL и подключение.',
+              sender: MessageSender.system,
+            );
+          });
+          reply = _messages[streamMessageIndex];
+        }
+      }
+
+      reply ??= const ChatMessage(
+        text: 'Сервер недоступен и локальная модель не готова. '
+            'Проверьте LOCAL_MODEL_URL и подключение.',
+        sender: MessageSender.system,
+      );
+    }
+
     if (!mounted) return;
 
     setState(() {
       _loading = false;
-      _messages.add(
-        reply ??
-            const ChatMessage(
-              text: 'Ошибка получения ответа.',
-              sender: MessageSender.system,
-            ),
-      );
+      final isAlreadyStreamed =
+          _messages.isNotEmpty && identical(_messages.last, reply);
+      if (!isAlreadyStreamed) {
+        _messages.add(
+          reply ??
+              const ChatMessage(
+                text: 'Ошибка получения ответа.',
+                sender: MessageSender.system,
+              ),
+        );
+      }
     });
     await _persist();
     await _scrollToBottom();
@@ -195,6 +280,40 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   constraints: const BoxConstraints(maxWidth: 600),
                   child: Column(
                     children: [
+                      if (_modelPreparing ||
+                          _localModelProgress.isActive ||
+                          AppConfig.localModelDiagnostics)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                _progressTitle(),
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.black54,
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              const SizedBox(height: 6),
+                              if (_localModelProgress.isActive)
+                                LinearProgressIndicator(
+                                  value: _localModelProgress.fraction,
+                                  color: AppColors.orange,
+                                  minHeight: 4,
+                                )
+                              else
+                                Text(
+                                  'Диагностика: ${_diagnosticReason()}',
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.black45,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
                       Expanded(
                         child: ListView.builder(
                           controller: _scroll,
@@ -380,5 +499,28 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       ),
       child: child,
     );
+  }
+
+  String _progressTitle() {
+    final fraction = _localModelProgress.fraction;
+    final percent = fraction == null ? null : (fraction * 100).toStringAsFixed(1);
+    if (percent == null) {
+      return _localModelProgress.message;
+    }
+    return '${_localModelProgress.message} ($percent%)';
+  }
+
+  String _diagnosticReason() {
+    switch (_localModelProgress.status) {
+      case LocalModelStatus.skipped:
+      case LocalModelStatus.error:
+      case LocalModelStatus.ready:
+      case LocalModelStatus.idle:
+        return _localModelProgress.message;
+      case LocalModelStatus.preparing:
+      case LocalModelStatus.downloading:
+      case LocalModelStatus.loading:
+        return 'Скачивание запущено';
+    }
   }
 }
