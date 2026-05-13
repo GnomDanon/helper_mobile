@@ -5,6 +5,7 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import '../config/app_config.dart';
 import '../models/chat_message.dart';
 import '../services/chat_api_service.dart';
+import '../services/emergency_rag_service.dart';
 import '../services/local_llm_service.dart';
 import '../services/chat_storage.dart';
 import '../theme/app_colors.dart';
@@ -29,6 +30,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final _scroll = ScrollController();
   final _api = ChatApiService();
   final _localLlm = LocalLlmService.instance;
+  final _rag = EmergencyRagService();
   final _storage = ChatStorage.instance;
   final stt.SpeechToText _speech = stt.SpeechToText();
 
@@ -145,7 +147,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
 
     if (reply == null) {
-      final localHistory = List<ChatMessage>.from(_messages);
       var streamMessageIndex = -1;
       var streamedText = '';
       try {
@@ -162,7 +163,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           await _scrollToBottom();
         }
 
-        await for (final token in _localLlm.streamResponse(text, localHistory)) {
+        final prepared = await _rag.prepare(text);
+        final prompt = prepared.groundedPrompt.trim().isNotEmpty
+            ? prepared.groundedPrompt
+            : text;
+        await for (final token in _localLlm.streamFromPrompt(prompt)) {
           streamedText += token;
           if (!mounted || streamMessageIndex < 0) continue;
           setState(() {

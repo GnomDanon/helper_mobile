@@ -90,6 +90,11 @@ class LocalLlmService {
   ) async* {
     await ensureReady();
     final prompt = _buildPrompt(userText, history);
+    yield* streamFromPrompt(prompt);
+  }
+
+  Stream<String> streamFromPrompt(String prompt) async* {
+    await ensureReady();
     final params = GenerationParams(
       maxTokens: AppConfig.localModelMaxTokens,
       temp: AppConfig.localModelTemperature,
